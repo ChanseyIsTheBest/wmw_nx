@@ -6,13 +6,17 @@
  * See wmw_tate.h for why this exists. Implementation notes:
  *
  * The engine renders into a portrait FBO sized so that rotating it 90 degrees
- * lands exactly on the panel -- 720x1280 handheld becomes 1280x720, 1080x1920
- * docked becomes 1920x1080. No letterboxing, no scaling: turn the console on
- * its side and the game fills the screen.
+ * lands exactly on the panel -- 1080x1920 becomes 1920x1080. No letterboxing,
+ * no scaling: turn the console on its side and the game fills the screen. This
+ * is the default (WMW_TATE_CW / WMW_TATE_CCW).
  *
- * Docked is different. You cannot rotate a television, so a rotated blit there
- * would be a sideways game. Docked therefore defaults to UPRIGHT, which centres
- * a 3:4 portrait image on the landscape panel with bars either side.
+ * WMW_TATE_UPRIGHT is the alternative, opted into via `pillarbox` in
+ * config.txt: no rotation, portrait image centred on the landscape panel with
+ * bars either side, for playing with the console held normally. Handy when you
+ * cannot or would rather not turn the console on its side (docked, or just
+ * preference) -- it is not automatic for docked, since a handheld player docks
+ * and undocks constantly and should not have their presentation mode change
+ * underneath them.
  *
  * This is GLES 1.1, so the blit is a textured quad through the fixed-function
  * pipeline rather than a shader. The rotation is expressed purely as a

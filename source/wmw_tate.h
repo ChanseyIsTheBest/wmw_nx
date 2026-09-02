@@ -24,11 +24,10 @@
 #ifndef __WMW_TATE_H__
 #define __WMW_TATE_H__
 
-// Presentation modes.
+// Presentation modes. Selected via config.txt: `pillarbox = 1` selects
+// UPRIGHT regardless of `rotation`; otherwise `rotation` selects CW/CCW.
+// See wmw_tate_mode() in config.c, the one place that combines the two.
 enum {
-  // UPRIGHT is implemented but no longer selectable from config.txt: the game is
-  // portrait and pillarboxing it wastes most of the panel. Kept because it costs
-  // nothing and is the obvious starting point if a landscape mode is ever wanted.
   WMW_TATE_UPRIGHT = 0, // portrait centred on the landscape panel, pillarboxed
   WMW_TATE_CW      = 1, // rotated 90 clockwise -- fills the screen
   WMW_TATE_CCW     = 2  // rotated 90 counter-clockwise -- fills the screen

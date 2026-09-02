@@ -251,14 +251,26 @@ static void ensure_database(void) {
 }
 
 static void set_screen_size(void) {
-  // Locked to the handheld panel in both modes. The portrait target is rotated
-  // onto it 1:1, so docking changes nothing: the engine is never told its
-  // resolution moved, and there is no re-layout to go wrong halfway through a
-  // level. Docked simply shows the same rotated image, upscaled by the console.
-  screen_width  = 1280;
-  screen_height = 720;
-  render_width  = 720;
-  render_height = 1280;
+  // Locked to the same size in both modes -- docking changes nothing: the
+  // engine is never told its resolution moved, and there is no re-layout to
+  // go wrong halfway through a level.
+  //
+  // 1080p rather than the handheld panel's native 720p: the OS downscales for
+  // free when handheld (a supersampled, slightly antialiased image on the
+  // 1280x720 panel) and presents 1:1, unscaled, when docked. WMW_PANEL_WIDTH_MM
+  // / HEIGHT_MM in config.h are scaled right alongside render_width/height so
+  // the engine's computed DPI -- and therefore which art-asset tier it loads
+  // -- is unchanged from the 720p numbers; only supersample it further without
+  // scaling those two together too.
+  //
+  // (A 720p-render / 1080p-window diagnostic variant briefly lived here while
+  // chasing the menu-transition stalls in the frame-timing log -- ruled out:
+  // the stalls persisted unchanged at 720p, so they are not resolution-linked
+  // and turned out to predate this work entirely.)
+  screen_width  = 1920;
+  screen_height = 1080;
+  render_width  = 1080;
+  render_height = 1920;
   debugPrintf("screen: window %dx%d, engine renders %dx%d (portrait)\n",
               screen_width, screen_height, render_width, render_height);
 }
@@ -487,11 +499,14 @@ static void input_init(void) {
   pcfg.screen_h = render_height;
 
   // The touch panel is bonded to the physical glass and does not rotate just
-  // because the image does, so it stays in landscape panel space.
-  pcfg.panel_w  = screen_width;
-  pcfg.panel_h  = screen_height;
+  // because the image does, so it stays in landscape panel space -- the
+  // digitizer's own FIXED native resolution, not screen_width/screen_height
+  // (our chosen swapchain size, which is a display-only concept the touch
+  // hardware has never heard of). See WMW_TOUCH_PANEL_W/H in config.h.
+  pcfg.panel_w  = WMW_TOUCH_PANEL_W;
+  pcfg.panel_h  = WMW_TOUCH_PANEL_H;
 
-  pcfg.rotation     = wmw_rotation_mode();
+  pcfg.rotation     = wmw_tate_mode();
   pcfg.handle_touch = 1;   // one owner for the input rotation, not two
   pcfg.data_dir     = wmw_game_dir();
   pcfg.log          = nxp_log;
@@ -561,8 +576,27 @@ static void dispatch_phase(int phase, const NxpEvent *ev, int n) {
   }
 }
 
+// Holding LS for 2s (see nx_pointer's gesture) flips between the rotated
+// fullscreen presentation and the pillarboxed upright one, live. Runs here --
+// the top of feed_pointer(), called once per frame before wmw_tate_begin()
+// rebinds for the frame -- so the FBO rebuild inside wmw_tate_init() never
+// leaves a frame rendering into a target that was just torn down.
+static void handle_mode_toggle(void) {
+  if (!nxp_toggle_requested()) return;
+
+  wmw_set_pillarbox_enabled(!wmw_pillarbox_enabled());
+  const int mode = wmw_tate_mode();
+  debugPrintf("main: mode toggle -- now %s\n",
+              mode == WMW_TATE_UPRIGHT ? "upright (pillarboxed)" : "rotated (fullscreen)");
+
+  if (!wmw_tate_init(render_width, render_height, screen_width, screen_height, mode))
+    debugPrintf("tate: re-init failed on live toggle -- portrait presentation disabled\n");
+  nxp_set_rotation(mode);
+}
+
 static void feed_pointer(void) {
   nxp_update();
+  handle_mode_toggle();
   NxpEvent ev[16];
   const int n = nxp_poll(ev, 16);
   if (!n) return;
@@ -653,7 +687,7 @@ int main(void) {
   // Portrait presentation. Must come after egl_init() (it needs a current
   // context) and before the engine is told its size.
   if (!wmw_tate_init(render_width, render_height,
-                     screen_width, screen_height, wmw_rotation_mode()))
+                     screen_width, screen_height, wmw_tate_mode()))
     debugPrintf("tate: portrait unavailable -- rendering landscape as-is\n");
 
   load_two_modules();

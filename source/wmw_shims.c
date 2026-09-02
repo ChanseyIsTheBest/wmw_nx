@@ -749,7 +749,13 @@ long lseek_fake2(int fd, long off, int whence) {
   return r;
 }
 
+// Real fds are small non-negative integers; the directory-sync sentinel
+// (wmw_dir_sync_fd(), below) is always negative, so this is unambiguous.
+static int is_dir_sync_fd(int fd) { return fd < 0; }
+
 int close_fake(int fd) {
+  if (is_dir_sync_fd(fd)) return 0;   // nothing real behind it to close
+
   if (wmw_io_tracked(fd)) {
     wmw_io_trace("  db close(fd=%d)\n", fd);
     wmw_io_track(fd, 0);
@@ -762,7 +768,18 @@ int close_fake(int fd) {
   return r;
 }
 
+// -2, -3, -4, ... -- -1 is already POSIX's "open failed" return, so start
+// clear of it. A 32-bit counter reaching INT_MIN would take ~2 billion
+// directory syncs; not a real concern for any play session.
+static int s_dir_sentinel_next = -2;
+
+int wmw_dir_sync_fd(void) {
+  return s_dir_sentinel_next--;
+}
+
 // The Switch has no write-back cache we can flush per-file; report success.
+// Already correct for a directory-sync sentinel fd (wmw_dir_sync_fd()) too --
+// the fd is unused, so there is nothing extra to special-case here.
 int fsync_fake(int fd) { (void)fd; return 0; }
 
 // This used to be a no-op returning success, which is a lie SQLite believes:

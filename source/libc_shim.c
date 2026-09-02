@@ -274,6 +274,31 @@ int open_fake(const char *path, int flags, ...) {
   wmw_file_lock();
   int fd = open(rp, convert_open_flags(flags), mode);
   wmw_file_unlock();
+
+  // sdmc's devoptab has no open() for directories -- only opendir() -- so a
+  // read-only open() of an existing directory always fails here with ENOENT,
+  // even though the directory plainly exists. SQLite's journal-commit
+  // durability step (unixOpenDirectory/unixSync in os_unix.c) does exactly
+  // that: open the containing directory read-only, fsync() it, close it. The
+  // SQLite this build carries (3.7.8) does not tolerate that open failing and
+  // retries the whole commit in a tight loop -- the multi-second stalls every
+  // save visible in the frame-timing log. fsync() is already a no-op on the
+  // Switch regardless of what it's pointed at (see fsync_fake), so the sync
+  // itself loses nothing by being faked outright; only the open needs help.
+  //
+  // (flags & 3) == 0 is O_RDONLY -- match the read-only directory-sync idiom
+  // specifically, not a write-intended open of a directory, which should keep
+  // failing loudly rather than silently swallow a caller's writes.
+  if (fd < 0 && errno == ENOENT && (flags & 3) == 0) {
+    struct stat st;
+    if (stat(rp, &st) == 0 && S_ISDIR(st.st_mode)) {
+      const int sentinel = wmw_dir_sync_fd();
+      debugPrintf("open(%s, 0x%x) -> directory; faking fd %d for fsync/close\n",
+                  rp, flags, sentinel);
+      return sentinel;
+    }
+  }
+
   // Assets go through fopen(); the engine's bundled SQLite is essentially the
   // only user of raw open(). Tracing the first few makes the database's view of
   // the filesystem visible, which is otherwise invisible behind SQLite's single
