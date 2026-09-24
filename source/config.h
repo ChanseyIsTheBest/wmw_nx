@@ -50,7 +50,14 @@
 #define WMW_DISPLAY_DENSITY 2.0f
 
 // Per-line SD-card writes are slow; set to 0 for release builds.
-#define DEBUG_LOG 1
+#define DEBUG_LOG 0
+
+// SDL audio period, in 48 kHz frames. The Switch SDL backend double-buffers at
+// this size, so output latency is roughly 1-2x this on top of FMOD's own ring
+// (4 x 512 frames at 24 kHz, ~64 ms ahead of its mixer). 1024 = 21.3 ms per
+// period. 512 is snappier still; go back up to 2048 only if you hear crackle
+// (the heartbeat line in debug.log will show a rising underrun count).
+#define WMW_AUDIO_SAMPLES 1024
 
 // Frame rate the main loop is held to. The panel is 60 Hz and the engine has no
 // internal limiter, so this is what actually paces the game.

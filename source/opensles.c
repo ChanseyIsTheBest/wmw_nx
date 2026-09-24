@@ -3,12 +3,40 @@
  * This software may be modified and distributed under the terms
  * of the MIT license. See the LICENSE file for details.
  *
- * Implements the slice of OpenSL ES 1.0.1 the SQEX "Sd" sound driver uses:
- * the Object interface (Realize/GetInterface/Destroy), the Engine interface
- * (CreateOutputMix/CreateAudioPlayer), and on each player the Play, Volume and
- * AndroidSimpleBufferQueue interfaces. Players are software-mixed into one SDL2
- * audio device; the buffer-queue completion callback is fired from the SDL
- * audio thread, exactly like Android's fast-track callback.
+ * Implements the slice of OpenSL ES 1.0.1 that FMOD Ex's "OpenSL ES Output"
+ * uses: the Object interface (Realize/GetInterface/Destroy), the Engine
+ * interface (CreateOutputMix/CreateAudioPlayer), and on each player the Play,
+ * Volume, AndroidConfiguration and AndroidSimpleBufferQueue interfaces.
+ * Players are software-mixed into one SDL2 audio device.
+ *
+ * Buffer-queue semantics -- read this before changing the mixer.
+ *
+ * An OpenSL buffer queue holds POINTERS. Enqueue() does not copy: the audio
+ * system reads the buffer when that buffer reaches the head of the queue and
+ * is actually played, then fires the completion callback. FMOD Ex depends on
+ * this. From libfmodex.so's fmod_output_opensl.cpp (disassembled):
+ *
+ *   - init allocates a ring of dspNumBuffers blocks (default 4 x 512 frames at
+ *     24 kHz, i.e. 21.3 ms each) and enqueues every block up front;
+ *   - the completion callback does no mixing at all. It re-enqueues the block
+ *     that just finished and advances an offset P;
+ *   - getposition() reports P, and FMOD's polled mixer thread (10 ms period)
+ *     mixes fresh audio into the blocks BEHIND P -- blocks that are already
+ *     sitting in the queue, waiting to be played.
+ *
+ * So FMOD writes into a block after enqueuing it and relies on it not being
+ * read until its turn comes. A shim that copies at Enqueue() time captures the
+ * block's previous contents instead, and every sound comes out one full ring
+ * (~85 ms) late. The previous version of this file did exactly that, and then
+ * parked the copies behind a ~330 ms decoupling ring fed by a pump thread
+ * (a design inherited from a BASS port, where the callback does the mixing).
+ * Together with a 2048-frame SDL period that added up to the ~0.5 s delay
+ * between tapping a button and hearing its click.
+ *
+ * Now the SDL audio callback pulls straight from the queued buffers, the way
+ * AudioFlinger does, and fires the completion callback as each buffer is
+ * finished. The end-to-end latency is FMOD's own ring (as on Android) plus
+ * the SDL device period (WMW_AUDIO_SAMPLES).
  */
 
 #include <stdlib.h>
@@ -19,13 +47,22 @@
 #include <SDL2/SDL.h>
 
 #include "opensles.h"
+#include "config.h"
 #include "util.h"
+
+// Frames per SDL audio callback at 48 kHz. The Switch SDL backend double-
+// buffers at this size, so it is also most of the output latency: 1024 frames
+// is 21.3 ms per buffer. See config.h to override.
+#ifndef WMW_AUDIO_SAMPLES
+#define WMW_AUDIO_SAMPLES 1024
+#endif
 
 // --- OpenSL ES constants ----------------------------------------------------
 
 #define SL_RESULT_SUCCESS              0
 #define SL_RESULT_PARAMETER_INVALID    0x0D
 #define SL_RESULT_FEATURE_UNSUPPORTED  0x0C
+#define SL_RESULT_BUFFER_INSUFFICIENT  0x07
 
 #define SL_BOOLEAN_FALSE 0
 #define SL_BOOLEAN_TRUE  1
@@ -166,7 +203,7 @@ typedef struct {
 // --- objects ----------------------------------------------------------------
 
 #define MAX_PLAYERS 32
-#define BQ_SLOTS 128
+#define BQ_SLOTS 128   // queue depth limit; FMOD uses dspNumBuffers (4)
 
 typedef struct {
   const void *data;
@@ -184,33 +221,29 @@ typedef struct Player {
   int rate;
   int playing;
   int bytes_per_sample; // 1/2/4, per the source PCM format
-  int is_float;         // PCM_EX float representation (BASS often uses this)
+  int is_float;         // PCM_EX float representation
+  int frame_bytes;      // bytes_per_sample * channels
   float gain; // linear, from SetVolumeLevel (millibels)
+  int locator_buffers;  // numBuffers the creator declared (diagnostics only)
 
   slBufferQueueCallback cb;
   void *cb_ctx;
 
-  // FIFO of enqueued buffers (legacy fields kept for GetState/Clear shape)
+  // The buffer queue proper: pointers only, read at play time (see the top of
+  // this file). q[q_head] is the buffer being played; cur_pos is how far into
+  // it the mixer has read.
   BQBuffer q[BQ_SLOTS];
-  int q_head, q_tail;
-  const uint8_t *cur;
-  SLuint32 cur_size, cur_pos;
+  int q_head, q_count;
+  SLuint32 cur_pos;
+  SLuint32 played;      // buffers completed, for GetState's 'index'
 
-  // Decoupling ring: bq_Enqueue converts BASS's PCM to S16 stereo and writes it
-  // here; the audio callback drains it. A pump thread keeps it topped up by
-  // firing the completion callback, so playback never depends on BASS's timing.
-  int16_t *ring;     // interleaved S16 stereo, ring_cap frames
-  int ring_cap;      // capacity in frames
-  int ring_head;     // read index (frames)
-  int ring_count;    // frames currently buffered
-  SDL_Thread *pump;
-  volatile int alive;
-
-  // Resampling state. The device runs at the Switch's native rate; a player
-  // mixing at a different rate is converted here rather than by SDL. See
-  // ensure_device() for why.
-  uint64_t rs_phase;      // 32.32 fixed point, position within the ring
-  int16_t  rs_prev[2];    // last frame consumed, for interpolation across calls
+  // Streaming linear resampler from p->rate to the device rate. rs_phase is
+  // 32.32 fixed point: the position between rs_prev and rs_next. It and the
+  // two frames persist across callbacks and across buffer boundaries, so the
+  // interpolation never restarts and never clicks at a boundary.
+  uint64_t rs_phase;
+  int32_t  rs_prev[2];
+  int32_t  rs_next[2];
 
   SDL_mutex *lock;
 } Player;
@@ -235,14 +268,12 @@ static Player *g_players[MAX_PLAYERS];
 static int g_player_count = 0;
 static SDL_mutex *g_reg_lock = NULL;
 
-// diagnostics (audio thread + BASS callback thread; exact atomicity not needed)
-static volatile long g_enq_count = 0;   // total bq_Enqueue calls
-static volatile long g_cb_count = 0;    // total completion callbacks fired
-static volatile long g_underrun_count = 0; // times a player ran dry
-static volatile int  g_ring_last = 0;   // ring fill (frames) at last drain
-static volatile int  g_ring_min = 1 << 30; // min ring fill since last heartbeat
-static volatile int  g_enq_peak = 0;     // max |sample| enqueued since last heartbeat
-static volatile long g_enq_silent = 0;   // cumulative near-silent frames BASS fed us
+// diagnostics (audio thread + FMOD threads; exact atomicity not needed)
+static volatile long g_enq_count = 0;      // total bq_Enqueue calls
+static volatile long g_cb_count = 0;       // total completion callbacks fired
+static volatile long g_underrun_count = 0; // callbacks where a playing player ran dry
+static volatile long g_enq_rejected = 0;   // Enqueue calls refused (queue full / bad args)
+static volatile int  g_q_min = 1 << 30;    // min queued buffers seen since last heartbeat
 
 #define MOVIE_RING_FRAMES 65536
 static SDL_mutex *g_movie_lock = NULL;
@@ -279,125 +310,106 @@ static inline int32_t read_sample(const uint8_t *src, int bps, int is_float) {
   return 0;
 }
 
-// Mix one player's buffered audio into the S16 stereo accumulator. This only
-// drains the ring; it never calls back into BASS (the pump thread does that),
-// so the audio callback stays short and never blocks on BASS's mixing.
-static void mix_player(Player *p, int32_t *acc, int frames) {
-  if (!p->playing || !p->ring)
-    return;
 
-  const float g = p->gain;
-  SDL_LockMutex(p->lock);
+// Retire the buffer at the head of the queue and fire the completion callback,
+// exactly as OpenSL does when a buffer finishes playing. Called with p->lock
+// held; the lock is dropped around the callback because FMOD's callback calls
+// straight back into bq_Enqueue() to re-queue the block.
+//
+// FMOD's callback is a handful of instructions (re-enqueue, advance an offset)
+// so running it on the SDL audio thread is safe -- it is also where Android
+// runs it.
+static void retire_head(Player *p) {
+  p->q_head = (p->q_head + 1) % BQ_SLOTS;
+  p->q_count--;
+  p->cur_pos = 0;
+  p->played++;
 
-  const int avail = p->ring_count;
-  g_ring_last = avail;
-  if (avail < g_ring_min) g_ring_min = avail;
+  slBufferQueueCallback cb = p->cb;
+  void *ctx = p->cb_ctx;
+  if (cb) {
+    g_cb_count++;
+    SDL_UnlockMutex(p->lock);
+    cb(&p->bq_vt, ctx);
+    SDL_LockMutex(p->lock);
+  }
+}
 
-  if (p->rate == g_dev_rate) {
-    // Rates agree: straight copy.
-    const int n = p->ring_count < frames ? p->ring_count : frames;
-    for (int i = 0; i < n; i++) {
-      const int rd = (p->ring_head + i) % p->ring_cap;
-      acc[i * 2 + 0] += (int32_t)(p->ring[rd * 2 + 0] * g);
-      acc[i * 2 + 1] += (int32_t)(p->ring[rd * 2 + 1] * g);
+// Read the next source frame from the queue as S16 stereo. Returns 0 when there
+// is nothing to read (queue empty, or the player was stopped while the lock was
+// dropped for a callback). Called with p->lock held.
+static int bq_pull_frame(Player *p, int32_t out[2]) {
+  for (;;) {
+    // Re-checked every time round: retire_head() drops the lock, and FMOD's
+    // stop path is SetPlayState(STOPPED) -> Clear -> free its ring. Once we see
+    // 'stopped' under the lock, the queued pointers must not be touched.
+    if (!p->playing || p->q_count <= 0)
+      return 0;
+
+    const BQBuffer *b = &p->q[p->q_head];
+    const SLuint32 fb = (SLuint32)p->frame_bytes;
+    if (p->cur_pos + fb <= b->size) {
+      const uint8_t *s = (const uint8_t *)b->data + p->cur_pos;
+      const int bps = p->bytes_per_sample;
+      int32_t l = read_sample(s, bps, p->is_float);
+      int32_t r = (p->channels >= 2) ? read_sample(s + bps, bps, p->is_float) : l;
+      out[0] = l;
+      out[1] = r;
+      p->cur_pos += fb;
+      // Last whole frame of this buffer consumed: it has "finished playing".
+      if (p->cur_pos + fb > b->size)
+        retire_head(p);
+      return 1;
     }
-    p->ring_head = (p->ring_head + n) % p->ring_cap;
-    p->ring_count -= n;
-    if (n < frames) g_underrun_count++;
+    // Empty buffer or a sub-frame tail -- nothing playable, just retire it.
+    retire_head(p);
+  }
+}
+
+// Mix one player into the S16 stereo accumulator, resampling from the player's
+// rate to the device rate. Pulls directly from the queued buffers.
+static void mix_player(Player *p, int32_t *acc, int frames) {
+  SDL_LockMutex(p->lock);
+  if (!p->playing) {
     SDL_UnlockMutex(p->lock);
     return;
   }
 
-  /* Linear resample from p->rate to the device rate.
-   *
-   * rs_phase is a 32.32 fixed-point read position measured in SOURCE frames
-   * from the current ring head, and it persists across callbacks. That
-   * continuity is the whole point: a resampler that restarts at phase 0 every
-   * callback drops or repeats a fraction of a frame at each boundary, which at
-   * ~12 callbacks a second is precisely the repeating, glitchy artefact this
-   * replaces. rs_prev carries the last source frame across the same boundary so
-   * interpolation has something to work from.
-   */
+  if (p->q_count < g_q_min) g_q_min = p->q_count;
+
+  const uint64_t ONE = 1ULL << 32;
   const uint64_t step = ((uint64_t)p->rate << 32) / (uint64_t)g_dev_rate;
-  int produced = 0;
+  const float g = p->gain;
 
-  for (; produced < frames; produced++) {
-    const uint64_t idx = p->rs_phase >> 32;
-    if ((int)idx >= p->ring_count)
-      break;                                  // ran out of source material
-
-    const uint32_t frac = (uint32_t)(p->rs_phase & 0xffffffffu);
-    const int32_t w1 = (int32_t)(frac >> 17);  // 0..32767
-    const int32_t w0 = 32768 - w1;
-
-    const int rd = (p->ring_head + (int)idx) % p->ring_cap;
-    for (int ch = 0; ch < 2; ch++) {
-      const int32_t b = p->ring[rd * 2 + ch];
-      const int32_t a = (idx == 0)
-                          ? p->rs_prev[ch]
-                          : p->ring[(((p->ring_head + (int)idx - 1) % p->ring_cap) * 2) + ch];
-      const int32_t s = (a * w0 + b * w1) >> 15;
-      acc[produced * 2 + ch] += (int32_t)(s * g);
+  for (int i = 0; i < frames; i++) {
+    // Slide the interpolation window forward one source frame for every whole
+    // source frame the phase has passed.
+    while (p->rs_phase >= ONE) {
+      int32_t f[2];
+      if (!bq_pull_frame(p, f)) {
+        // Ran dry. Leave rs_phase >= ONE so the next callback resumes by
+        // pulling, and leave the rest of this block silent.
+        if (p->playing) g_underrun_count++;
+        SDL_UnlockMutex(p->lock);
+        return;
+      }
+      p->rs_prev[0] = p->rs_next[0];
+      p->rs_prev[1] = p->rs_next[1];
+      p->rs_next[0] = f[0];
+      p->rs_next[1] = f[1];
+      p->rs_phase -= ONE;
     }
+
+    const int32_t w1 = (int32_t)((uint32_t)p->rs_phase >> 17); // 0..32767
+    const int32_t w0 = 32768 - w1;
+    const int32_t sl = (p->rs_prev[0] * w0 + p->rs_next[0] * w1) >> 15;
+    const int32_t sr = (p->rs_prev[1] * w0 + p->rs_next[1] * w1) >> 15;
+    acc[i * 2 + 0] += (int32_t)(sl * g);
+    acc[i * 2 + 1] += (int32_t)(sr * g);
     p->rs_phase += step;
   }
 
-  // Retire the source frames fully consumed, and keep the fractional remainder
-  // in rs_phase so the next callback resumes mid-sample rather than snapping.
-  const int consumed = (int)(p->rs_phase >> 32);
-  if (consumed > 0) {
-    const int last = (p->ring_head + consumed - 1) % p->ring_cap;
-    p->rs_prev[0] = p->ring[last * 2 + 0];
-    p->rs_prev[1] = p->ring[last * 2 + 1];
-    p->ring_head = (p->ring_head + consumed) % p->ring_cap;
-    p->ring_count -= consumed;
-    p->rs_phase &= 0xffffffffULL;             // keep only the fraction
-  }
-
-  if (produced < frames) g_underrun_count++;
   SDL_UnlockMutex(p->lock);
-}
-
-// Pump thread: keep the ring topped up to ~330ms by prompting BASS to render and
-// enqueue. Crucially, when a prompt produces nothing (BASS's stream decoder is
-// behind or blocked), it must YIELD the CPU generously rather than spin -- a busy
-// pump starves BASS's own update/decode thread and turns a brief gap into a long
-// stall (music drops out while pre-decoded SFX keep playing). Runs off the audio
-// thread so BASS's mixing can't blow the audio deadline.
-static int pump_thread(void *arg) {
-  Player *p = (Player *)arg;
-  const int target = p->rate / 3; // ~330 ms of headroom to ride out the mixer's bursts
-  int misses = 0;
-  while (p->alive) {
-    if (!p->playing || !p->cb) { SDL_Delay(5); misses = 0; continue; }
-
-    int fill;
-    SDL_LockMutex(p->lock);
-    fill = p->ring_count;
-    SDL_UnlockMutex(p->lock);
-
-    if (fill >= target) { SDL_Delay(3); misses = 0; continue; }
-
-    g_cb_count++;
-    p->cb(&p->bq_vt, p->cb_ctx); // -> BASS renders + bq_Enqueue -> ring grows
-
-    int fill2;
-    SDL_LockMutex(p->lock);
-    fill2 = p->ring_count;
-    SDL_UnlockMutex(p->lock);
-
-    if (fill2 > fill) {
-      // Made progress; keep filling with only a tiny yield.
-      misses = 0;
-      SDL_Delay(1);
-    } else {
-      // No data produced: hand the CPU to BASS's decode thread, escalating the
-      // back-off if it stays stalled so we never busy-wait on an empty stream.
-      misses++;
-      SDL_Delay(misses < 3 ? 8 : 20);
-    }
-  }
-  return 0;
 }
 
 static void mix_movie(int32_t *acc, int frames) {
@@ -431,17 +443,18 @@ static void SDLCALL audio_callback(void *ud, Uint8 *stream, int len) {
   if (frames > 8192) { memset(stream, 0, len); return; }
   memset(acc, 0, frames * 2 * sizeof(int32_t));
 
-  // heartbeat: every ~2s of callbacks, report the pipeline counters so a stall
-  // is visible in the log (does the enqueue/callback chain keep moving?).
-  static int hb = 0;
-  if (++hb >= 48) { // 48 * 2048 / 48000 ~= 2.05s
-    hb = 0;
-    debugPrintf("opensles: hb enq=%ld cb=%ld underrun=%ld ring=%d min=%d peak=%d silent=%ld players=%d\n",
-                g_enq_count, g_cb_count, g_underrun_count,
-                g_ring_last, (g_ring_min == (1 << 30) ? -1 : g_ring_min),
-                g_enq_peak, g_enq_silent, g_player_count);
-    g_ring_min = 1 << 30;
-    g_enq_peak = 0;
+  // heartbeat: every ~2 s of audio, report the pipeline counters so a stall is
+  // visible in the log. 'qmin' is the fewest buffers FMOD had queued at the
+  // start of a callback -- it should sit at dspNumBuffers-1 or so; 0 plus a
+  // rising underrun count means FMOD's mixer is not keeping up.
+  static long hb_frames = 0;
+  hb_frames += frames;
+  if (hb_frames >= (long)g_dev_rate * 2) {
+    hb_frames = 0;
+    debugPrintf("opensles: hb enq=%ld cb=%ld underrun=%ld rejected=%ld qmin=%d players=%d\n",
+                g_enq_count, g_cb_count, g_underrun_count, g_enq_rejected,
+                (g_q_min == (1 << 30) ? -1 : g_q_min), g_player_count);
+    g_q_min = 1 << 30;
   }
 
   SDL_LockMutex(g_reg_lock);
@@ -485,13 +498,11 @@ static void ensure_device(int rate) {
   // That works, but it puts SDL's internal resampler in the path for every
   // sample, and on this platform that is where the audio broke up: FMOD mixes
   // at 24000 Hz, the hardware is fixed at 48000, and the conversion produced
-  // audible repeats and glitching even though the pipeline never underran
-  // (underrun=0, ring fill stable at ~340 ms).
+  // audible repeats and glitching.
   //
   // Opening at the hardware rate means SDL converts nothing, and mix_player()
   // does the conversion itself with a per-player phase accumulator that
-  // persists across callbacks -- so there is no discontinuity at buffer
-  // boundaries, which is exactly what a per-callback resampler gets wrong.
+  // persists across callbacks and buffer boundaries.
   const int dev_rate = 48000;
   (void)rate;
 
@@ -500,19 +511,17 @@ static void ensure_device(int rate) {
   want.freq = dev_rate;
   want.format = AUDIO_S16SYS;
   want.channels = 2;
-  want.samples = 2048;
+  want.samples = WMW_AUDIO_SAMPLES;
   want.callback = audio_callback;
 
-  // allowed_changes = 0 asks SDL to guarantee the format we requested and do
-  // any conversion itself. That matters here: FMOD mixes at 24000 Hz and the
-  // Switch's audio output is fixed at 48000, so something must resample. SDL
-  // doing it means the mixer below never has to.
+  // allowed_changes = 0: we want exactly this spec. Anything SDL had to adapt
+  // would go through an SDL_AudioStream, which adds both a resampler and a
+  // buffer -- latency this file is trying to keep out.
   g_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
 
   if (!g_dev) {
-    // Fall back to letting SDL pick a rate rather than ending up silent. The
-    // mixer has no resampler, so this will play at the wrong pitch -- but a
-    // wrong-pitch game is diagnosable and a silent one is not.
+    // Fall back to letting SDL pick a rate rather than ending up silent.
+    // mix_player() resamples to whatever g_dev_rate ends up being.
     debugPrintf("opensles: strict open failed (%s); retrying with rate changes allowed\n",
                 SDL_GetError());
     g_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
@@ -525,8 +534,9 @@ static void ensure_device(int rate) {
 
   g_dev_rate = have.freq;
   SDL_PauseAudioDevice(g_dev, 0);
-  debugPrintf("opensles: audio device opened -- %d Hz, %d ch, %d samples (players resampled to this)\n",
-              have.freq, have.channels, have.samples);
+  debugPrintf("opensles: audio device opened -- %d Hz, %d ch, %d samples (%.1f ms/period, double-buffered)\n",
+              have.freq, have.channels, have.samples,
+              have.freq ? have.samples * 1000.0 / have.freq : 0.0);
   if (have.channels != 2)
     debugPrintf("opensles: WARNING got %d channels, expected 2\n", have.channels);
 }
@@ -650,35 +660,31 @@ void opensles_movie_end(void) {
 }
 
 // --- buffer queue interface -------------------------------------------------
+//
+// Enqueue stores the POINTER. The buffer is read by mix_player() when it
+// reaches the head of the queue -- see the top of this file for why copying
+// here is wrong for FMOD.
 
 static SLresult bq_Enqueue(void *self, const void *pBuffer, SLuint32 size) {
   Player *p = CONTAINER(self, Player, bq_vt);
-  const uint8_t *src = (const uint8_t *)pBuffer;
-  const int bps = p->bytes_per_sample > 0 ? p->bytes_per_sample : 2;
-  const int stereo = (p->channels >= 2);
-  const int frame_bytes = bps * (stereo ? 2 : 1);
-  const int frames = frame_bytes ? (int)(size / frame_bytes) : 0;
+  if (!pBuffer || size == 0) {
+    g_enq_rejected++;
+    return SL_RESULT_PARAMETER_INVALID;
+  }
 
   SDL_LockMutex(p->lock);
-  for (int i = 0; i < frames; i++) {
-    if (p->ring_count >= p->ring_cap) break; // ring full: drop excess (pump paces)
-    const uint8_t *s = src + (size_t)i * frame_bytes;
-    int32_t l = read_sample(s, bps, p->is_float);
-    int32_t r = stereo ? read_sample(s + bps, bps, p->is_float) : l;
-    if (l > 32767) l = 32767; else if (l < -32768) l = -32768;
-    if (r > 32767) r = 32767; else if (r < -32768) r = -32768;
-    // silence meter: is BASS actually feeding audio, or zeros? (a full ring of
-    // zeros = audible cutout with underrun=0, which the other counters miss)
-    int a = l < 0 ? -l : l;
-    int b = r < 0 ? -r : r;
-    if (b > a) a = b;
-    if (a > g_enq_peak) g_enq_peak = a;
-    if (a < 16) g_enq_silent++; // ~ -66 dBFS: effectively silent
-    const int w = (p->ring_head + p->ring_count) % p->ring_cap;
-    p->ring[w * 2 + 0] = (int16_t)l;
-    p->ring[w * 2 + 1] = (int16_t)r;
-    p->ring_count++;
+  // Android caps the queue at the numBuffers the player was created with.
+  const int cap = (p->locator_buffers > 0 && p->locator_buffers < BQ_SLOTS)
+                    ? p->locator_buffers : BQ_SLOTS;
+  if (p->q_count >= cap) {
+    SDL_UnlockMutex(p->lock);
+    g_enq_rejected++;
+    return SL_RESULT_BUFFER_INSUFFICIENT;
   }
+  const int tail = (p->q_head + p->q_count) % BQ_SLOTS;
+  p->q[tail].data = pBuffer;
+  p->q[tail].size = size;
+  p->q_count++;
   g_enq_count++;
   SDL_UnlockMutex(p->lock);
   return SL_RESULT_SUCCESS;
@@ -687,10 +693,12 @@ static SLresult bq_Enqueue(void *self, const void *pBuffer, SLuint32 size) {
 static SLresult bq_Clear(void *self) {
   Player *p = CONTAINER(self, Player, bq_vt);
   SDL_LockMutex(p->lock);
-  p->q_head = p->q_tail = 0;
-  p->cur = NULL;
-  p->cur_pos = p->cur_size = 0;
-  p->ring_head = p->ring_count = 0;
+  p->q_head = p->q_count = 0;
+  p->cur_pos = 0;
+  // Restart the resampler so nothing from before the Clear bleeds through.
+  p->rs_phase = 1ULL << 32;
+  p->rs_prev[0] = p->rs_prev[1] = 0;
+  p->rs_next[0] = p->rs_next[1] = 0;
   SDL_UnlockMutex(p->lock);
   return SL_RESULT_SUCCESS;
 }
@@ -701,19 +709,20 @@ static SLresult bq_GetState(void *self, void *pState) {
   Player *p = CONTAINER(self, Player, bq_vt);
   if (pState) {
     SLBufferQueueState *st = pState;
-    // Report "empty" so BASS always feels free to render the next block when we
-    // prompt it; the pump thread is what actually paces production via the ring.
-    (void)p;
-    st->count = 0;
-    st->index = 0;
+    SDL_LockMutex(p->lock);
+    st->count = (SLuint32)p->q_count;  // buffers still queued
+    st->index = p->played;             // buffers completed so far
+    SDL_UnlockMutex(p->lock);
   }
   return SL_RESULT_SUCCESS;
 }
 
 static SLresult bq_RegisterCallback(void *self, slBufferQueueCallback cb, void *ctx) {
   Player *p = CONTAINER(self, Player, bq_vt);
+  SDL_LockMutex(p->lock);
   p->cb = cb;
   p->cb_ctx = ctx;
+  SDL_UnlockMutex(p->lock);
   debugPrintf("opensles: bq RegisterCallback cb=%p\n", (void *)cb);
   return SL_RESULT_SUCCESS;
 }
@@ -728,8 +737,19 @@ static SLresult play_SetPlayState(void *self, SLuint32 state) {
   Player *p = CONTAINER(self, Player, play_vt);
   SDL_LockMutex(p->lock);
   p->playing = (state == SL_PLAYSTATE_PLAYING);
+  // Report the latency this player's queue implies, once per start: FMOD keeps
+  // the queue full, so the newest mixed block is (queued - 1) blocks from the
+  // head. The SDL device adds one to two periods on top.
+  if (p->playing && p->q_count > 0 && p->frame_bytes > 0 && p->rate > 0) {
+    const int blk = (int)(p->q[p->q_head].size / (SLuint32)p->frame_bytes);
+    debugPrintf("opensles: SetPlayState PLAYING -- %d x %d-frame buffers @ %d Hz queued "
+                "(~%d ms ahead of the mixer) + device %d frames\n",
+                p->q_count, blk, p->rate,
+                (p->q_count - 1) * blk * 1000 / p->rate, WMW_AUDIO_SAMPLES);
+  } else {
+    debugPrintf("opensles: SetPlayState %u\n", (unsigned)state);
+  }
   SDL_UnlockMutex(p->lock);
-  debugPrintf("opensles: SetPlayState %u\n", (unsigned)state);
   return SL_RESULT_SUCCESS;
 }
 static SLresult play_GetPlayState(void *self, SLuint32 *pState) {
@@ -850,14 +870,13 @@ static SLresult player_GetInterface(void *self, const SLInterfaceID iid, void *p
 
 static void player_Destroy(void *self) {
   Player *p = CONTAINER(self, Player, obj_vt);
-  // Stop the pump first so it can't fire the callback into a half-freed player.
-  p->alive = 0;
-  if (p->pump) { SDL_WaitThread(p->pump, NULL); p->pump = NULL; }
+  // audio_callback() mixes every player while holding g_reg_lock, so once the
+  // player is unregistered under that lock the audio thread cannot be inside it
+  // (or inside its completion callback) any more.
   SDL_LockMutex(g_reg_lock);
   for (int i = 0; i < g_player_count; i++)
     if (g_players[i] == p) g_players[i] = NULL;
   SDL_UnlockMutex(g_reg_lock);
-  free(p->ring);
   if (p->lock) SDL_DestroyMutex(p->lock);
   free(p);
 }
@@ -903,15 +922,19 @@ static SLresult eng_CreateAudioPlayer(void *self, SLObjectItf *pPlayer, SLDataSo
       if (p->bytes_per_sample < 1) p->bytes_per_sample = 2;
     }
   }
+  // The locator is {locatorType, numBuffers} for both SL_DATALOCATOR_BUFFERQUEUE
+  // and SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE. FMOD passes dspNumBuffers.
+  if (src && src->pLocator) {
+    const SLDataLocator_BufferQueue *loc = src->pLocator;
+    p->locator_buffers = (int)loc->numBuffers;
+  }
+  if (p->channels < 1) p->channels = 2;
+  p->frame_bytes = p->bytes_per_sample * p->channels;
+
+  // Empty interpolation window: the first output frame pulls a source frame.
+  p->rs_phase = 1ULL << 32;
 
   ensure_device(p->rate);
-
-  // Allocate the decoupling ring (~1s) and start the pump thread.
-  p->ring_cap = p->rate > 0 ? p->rate : 44100; // 1 second of frames
-  p->ring = (int16_t *)calloc((size_t)p->ring_cap * 2, sizeof(int16_t));
-  p->ring_head = p->ring_count = 0;
-  p->alive = 1;
-  p->pump = SDL_CreateThread(pump_thread, "bass_pump", p);
 
   SDL_LockMutex(g_reg_lock);
   int slot = -1;
@@ -922,11 +945,13 @@ static SLresult eng_CreateAudioPlayer(void *self, SLObjectItf *pPlayer, SLDataSo
   if (slot >= 0)
     g_players[slot] = p;
   SDL_UnlockMutex(g_reg_lock);
+  if (slot < 0)
+    debugPrintf("opensles: WARNING player registry full -- this player will be silent\n");
 
   *pPlayer = &p->obj_vt;
-  debugPrintf("opensles: CreateAudioPlayer (%d Hz, %d ch, %d-bit %s)\n",
+  debugPrintf("opensles: CreateAudioPlayer (%d Hz, %d ch, %d-bit %s, %d buffers)\n",
               p->rate, p->channels, p->bytes_per_sample * 8,
-              p->is_float ? "float" : "int");
+              p->is_float ? "float" : "int", p->locator_buffers);
   return SL_RESULT_SUCCESS;
 }
 
