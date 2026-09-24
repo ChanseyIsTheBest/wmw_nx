@@ -13,7 +13,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET		:=	wmw_nx
 APP_TITLE	:=	Where's My Water?
 APP_AUTHOR	:=	ChanseyIsTheBest
-APP_VERSION	:=	1.0.0
+APP_VERSION	:=	1.0.1
 BUILD		:=	build
 SOURCES		:=	source
 DATA		:=	data
