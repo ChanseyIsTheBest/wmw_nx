@@ -96,6 +96,15 @@ uint64_t wmw_io_fake_ino_path(const char *path);
 // about our own open files must be answered from the descriptor instead.
 int wmw_io_fd_for_path(const char *path);
 
+// A stand-in fd for a directory opened purely so SQLite can fsync() it for
+// journal-commit durability (unixOpenDirectory/unixSync in SQLite's os_unix.c).
+// The sdmc devoptab has no open() for directories -- only opendir() -- so that
+// real open() always fails; see the call site in libc_shim.c's open_fake() for
+// the full story. Strictly negative and strictly decreasing so it can never
+// collide with a real fd (newlib's are small non-negative integers); close_fake()
+// recognises and retires it without touching the real fd table.
+int wmw_dir_sync_fd(void);
+
 // --- path-mapped file operations -----------------------------------------
 // These take Android-side paths and must go through wmw_resolve(); see
 // wmw_paths.c for why the engine hands us bare POSIX absolute paths.

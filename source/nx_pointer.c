@@ -71,6 +71,16 @@ static int s_mouse_connected = 0;
 /* d-pad auto-repeat for the sensitivity adjustment */
 static int   s_dpad_hold = 0;
 
+/* LS-held-2s mode-toggle gesture (see nxp_toggle_requested()). s_ls_fired
+ * latches once the hold has fired so it doesn't refire every frame the stick
+ * stays held past the threshold; it only clears on release, independently of
+ * whether/when the host has drained s_toggle_pending. */
+static int   s_ls_holding    = 0;
+static u64   s_ls_hold_tick  = 0;
+static int   s_ls_fired      = 0;
+static int   s_toggle_pending = 0;
+#define LS_HOLD_NS  2000000000ULL          /* 2 seconds */
+
 /* Settings persistence. A save is queued whenever a sensitivity changes and
  * committed 3s after the LAST change, so holding the D-pad through twenty steps
  * writes the file once rather than twenty times. */
@@ -410,12 +420,28 @@ static void do_touch(void) {
   const float sw = (float)s_cfg.screen_w, sh = (float)s_cfg.screen_h;
   const float pw = (float)s_cfg.panel_w,  ph = (float)s_cfg.panel_h;
 
+  /* rotation == 0: WMW_TATE_UPRIGHT (pillarboxed, no rotation). The portrait
+   * image is NOT rotated, only fit to the panel's full height and centred
+   * horizontally -- bars either side, not top/bottom. This must mirror
+   * compute_dest_rect()'s UPRIGHT branch in wmw_tate.c exactly (same scale,
+   * same horizontal centring, dy always spans the full panel height) or a
+   * touch lands somewhere other than where the pixel under it actually is.
+   * Two implementations of one transform is how they drift apart -- see the
+   * file header on why rotation itself is never duplicated either. */
+  const float upright_scale = ph / sh;                    /* == s_wh / s_rh there */
+  const float upright_box_w = sw * upright_scale;
+  const float upright_dx0   = (pw - upright_box_w) * 0.5f;
+
   for (int i = 0; i < count; i++) {
     const float px = (float)ts.touches[i].x, py = (float)ts.touches[i].y;
     float x, y;
     if      (s_rotation == 1) { x =        py * (sw / ph); y = (pw - px) * (sh / pw); }
     else if (s_rotation == 2) { x = (ph - py) * (sw / ph); y =       px  * (sh / pw); }
-    else                      { x =        px * (sw / pw); y =       py  * (sh / ph); }
+    else                      { x = (px - upright_dx0) / upright_scale;
+                                y =              py      / upright_scale; }
+    /* Clamped below to the visible render area either way, so a touch in the
+     * pillarbox bars lands at the nearest edge of the actual content -- never
+     * off it and never inside a bar that isn't part of the picture. */
     if (x < 0) x = 0;
     if (y < 0) y = 0;
     if (x > s_cfg.screen_w - 1) x = (float)(s_cfg.screen_w - 1);
@@ -653,6 +679,29 @@ void nxp_update(void) {
   const u64 held    = padGetButtons(&s_pad);
   const u64 pressed = padGetButtonsDown(&s_pad);
 
+  /* LS held for LS_HOLD_NS -- latch a mode-toggle request. Level, not edge:
+   * checked every frame the button is down, so it fires exactly once partway
+   * through the hold rather than needing a release first. s_ls_fired -- not
+   * s_toggle_pending -- gates the refire: the host may drain s_toggle_pending
+   * (reset it to 0) well before the stick is released, and elapsed time only
+   * grows, so gating on the queue instead of a hold-scoped latch fired again
+   * every single frame for the rest of the hold. */
+  if (held & HidNpadButton_StickL) {
+    if (!s_ls_holding) {
+      s_ls_holding   = 1;
+      s_ls_fired     = 0;
+      s_ls_hold_tick = armGetSystemTick();
+    } else if (!s_ls_fired &&
+               armTicksToNs(armGetSystemTick() - s_ls_hold_tick) >= LS_HOLD_NS) {
+      s_ls_fired       = 1;
+      s_toggle_pending = 1;
+      logf_("nxp: LS held 2s -- mode toggle requested\n");
+    }
+  } else {
+    s_ls_holding = 0;
+    s_ls_fired   = 0;
+  }
+
   /* '+' toggles the cursor; '-' toggles gyro pointing. */
   if (pressed & HidNpadButton_Plus) {
     s_visible = (s_visible > 0) ? 0 : 1;
@@ -733,6 +782,17 @@ float nxp_mouse_sens(void)              { return s_mouse_sens; }
 float nxp_gyro_sens(void)               { return s_gyro_sens; }
 int   nxp_gyro_enabled(void)            { return s_gyro_on && !s_mouse_connected; }
 int   nxp_mouse_connected(void)         { return s_mouse_connected; }
+
+int nxp_toggle_requested(void) {
+  if (!s_toggle_pending) return 0;
+  s_toggle_pending = 0;
+  return 1;
+}
+
+void nxp_set_rotation(int rotation) {
+  s_rotation = rotation;
+  logf_("nxp: rotation set to %d (live)\n", s_rotation);
+}
 
 
 /* ======================= GL overlay (GLES1 fixed-function) ================ *

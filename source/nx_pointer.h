@@ -23,6 +23,10 @@
  *   Gyro         tilt/turn the controller to point. Yaw moves X, pitch moves Y.
  *                A connected mouse takes priority: gyro is switched off while
  *                one is plugged in.
+ *   LS (held 2s) requests a mode-toggle gesture -- see nxp_toggle_requested().
+ *                This module has no opinion on what the toggle means; it only
+ *                detects the hold and reports it once, so the host decides
+ *                (e.g. flipping between a rotated and a pillarboxed display).
  *
  * Custom cursor
  * -------------
@@ -103,6 +107,17 @@ float nxp_mouse_sens(void);      /* current mouse sensitivity               */
 float nxp_gyro_sens(void);       /* current gyro sensitivity                */
 int   nxp_gyro_enabled(void);    /* gyro pointing active right now?         */
 int   nxp_mouse_connected(void); /* a USB mouse is present                  */
+
+/* One-shot latch for the LS-held-2s gesture: returns 1 the first time it is
+ * polled after the hold completes, then 0 until the next hold. Call once per
+ * frame; whoever calls it first each time is the one who sees it fire. */
+int   nxp_toggle_requested(void);
+
+/* Updates the display-rotation mode this module maps touch/stick/gyro input
+ * through, without a full re-init (nxp_init() no-ops once already ready).
+ * For a host that changes presentation mode live -- e.g. reacting to
+ * nxp_toggle_requested() -- and needs input to follow along immediately. */
+void  nxp_set_rotation(int rotation);
 
 /* Flush any pending settings write immediately (e.g. on shutdown). Normally the
  * save happens by itself 3s after the last change. */
